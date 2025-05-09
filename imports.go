@@ -29,6 +29,7 @@ import (
 	_ "github.com/mholt/caddy-l4/modules/l4rdp"
 	_ "github.com/mholt/caddy-l4/modules/l4regexp"
 	_ "github.com/mholt/caddy-l4/modules/l4remoteiplist"
+	_ "github.com/mholt/caddy-l4/modules/l4shadowtls"
 	_ "github.com/mholt/caddy-l4/modules/l4socks"
 	_ "github.com/mholt/caddy-l4/modules/l4ssh"
 	_ "github.com/mholt/caddy-l4/modules/l4subroute"
