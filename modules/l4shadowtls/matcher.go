@@ -4,19 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"go.uber.org/zap"
-
 	"github.com/mholt/caddy-l4/layer4"
-	"github.com/mholt/caddy-l4/modules/l4tls"
+	"go.uber.org/zap"
 )
 
 func init() {
 	caddy.RegisterModule(&MatchShadowTLS{})
 }
+
+const ClientHelloBytesKey = "l4.shadow_tls.client_hello_bytes"
 
 type MatchShadowTLS struct {
 	MatchersRaw caddy.ModuleMap `json:"-" caddy:"namespace=shadow_tls.handshake_match"`
@@ -77,6 +78,8 @@ func (m *MatchShadowTLS) Match(cx *layer4.Connection) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	helloBytes := slices.Concat(hdr, rawHello)
+	cx.SetVar(ClientHelloBytesKey, helloBytes)
 
 	// parse the ClientHello
 	chi := parseRawClientHello(rawHello)
@@ -118,7 +121,7 @@ func (m *MatchShadowTLS) Match(cx *layer4.Connection) (bool, error) {
 func (m *MatchShadowTLS) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume wrapper name
 
-	matcherSet, err := l4tls.ParseCaddyfileNestedMatcherSet(d)
+	matcherSet, err := ParseCaddyfileNestedMatcherSet(d)
 	if err != nil {
 		return err
 	}
@@ -130,5 +133,51 @@ func (m *MatchShadowTLS) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // Interface guards
 var (
 	_ layer4.ConnMatcher    = (*MatchShadowTLS)(nil)
+	_ caddy.Provisioner     = (*MatchShadowTLS)(nil)
 	_ caddyfile.Unmarshaler = (*MatchShadowTLS)(nil)
+	_ json.Marshaler        = (*MatchShadowTLS)(nil)
+	_ json.Unmarshaler      = (*MatchShadowTLS)(nil)
 )
+
+func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, error) {
+	matcherMap := make(map[string]caddytls.ConnectionMatcher)
+
+	tokensByMatcherName := make(map[string][]caddyfile.Token)
+	for nesting := d.Nesting(); d.NextArg() || d.NextBlock(nesting); {
+		matcherName := d.Val()
+		tokensByMatcherName[matcherName] = append(tokensByMatcherName[matcherName], d.NextSegment()...)
+	}
+
+	for matcherName, tokens := range tokensByMatcherName {
+		dd := caddyfile.NewDispenser(tokens)
+		dd.Next() // consume wrapper name
+		mod, err := caddy.GetModule("shadow_tls.handshake_match." + matcherName)
+		if err != nil {
+			return nil, d.Errf("getting matcher module '%s': %v", matcherName, err)
+		}
+		unm, ok := mod.New().(caddyfile.Unmarshaler)
+		if !ok {
+			return nil, d.Errf("matcher module '%s' is not a Caddyfile unmarshaler", matcherName)
+		}
+		err = unm.UnmarshalCaddyfile(dd.NewFromNextSegment())
+		if err != nil {
+			return nil, err
+		}
+		cm, ok := unm.(caddytls.ConnectionMatcher)
+		if !ok {
+			return nil, fmt.Errorf("matcher module '%s' is not a connection matcher", matcherName)
+		}
+		matcherMap[matcherName] = cm
+	}
+
+	matcherSet := make(caddy.ModuleMap)
+	for name, matcher := range matcherMap {
+		jsonBytes, err := json.Marshal(matcher)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling %T matcher: %v", matcher, err)
+		}
+		matcherSet[name] = jsonBytes
+	}
+
+	return matcherSet, nil
+}
