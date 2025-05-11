@@ -18,6 +18,7 @@ func init() {
 }
 
 const ClientHelloBytesKey = "l4.shadow_tls.client_hello_bytes"
+const ClientHelloInfoKey = "l4.shadow_tls.client_hello_info"
 
 type MatchShadowTLS struct {
 	MatchersRaw caddy.ModuleMap `json:"-" caddy:"namespace=shadow_tls.handshake_match"`
@@ -84,6 +85,7 @@ func (m *MatchShadowTLS) Match(cx *layer4.Connection) (bool, error) {
 	// parse the ClientHello
 	chi := parseRawClientHello(rawHello)
 	chi.Conn = cx
+	cx.SetVar(ClientHelloInfoKey, chi)
 
 	// also add values to the replacer
 	repl := cx.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
@@ -165,7 +167,7 @@ func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, er
 		}
 		cm, ok := unm.(caddytls.ConnectionMatcher)
 		if !ok {
-			return nil, fmt.Errorf("matcher module '%s' is not a connection matcher", matcherName)
+			return nil, d.Errf("matcher module '%s' is not a connection matcher", matcherName)
 		}
 		matcherMap[matcherName] = cm
 	}
@@ -174,7 +176,7 @@ func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, er
 	for name, matcher := range matcherMap {
 		jsonBytes, err := json.Marshal(matcher)
 		if err != nil {
-			return nil, fmt.Errorf("marshaling %T matcher: %v", matcher, err)
+			return nil, d.Errf("marshaling %T matcher: %v", matcher, err)
 		}
 		matcherSet[name] = jsonBytes
 	}
