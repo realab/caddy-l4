@@ -19,6 +19,7 @@ func init() {
 
 const ClientHelloBytesKey = "l4.shadow_tls.client_hello_bytes"
 const ClientHelloInfoKey = "l4.shadow_tls.client_hello_info"
+const ClientHelloPasswordKey = "l4.shadow_tls.client_hello_password"
 
 type MatchShadowTLS struct {
 	MatchersRaw caddy.ModuleMap `json:"-" caddy:"namespace=shadow_tls.handshake_match"`
@@ -75,8 +76,7 @@ func (m *MatchShadowTLS) Match(cx *layer4.Connection) (bool, error) {
 	// get length of the ClientHello message and read it
 	length := int(uint16(hdr[3])<<8 | uint16(hdr[4])) // ignoring version in hdr[1:3] - like https://github.com/inetaf/tcpproxy/blob/master/sni.go#L170
 	rawHello := make([]byte, length)
-	_, err = io.ReadFull(cx, rawHello)
-	if err != nil {
+	if _, err := io.ReadFull(cx, rawHello); err != nil {
 		return false, err
 	}
 	helloBytes := slices.Concat(hdr, rawHello)

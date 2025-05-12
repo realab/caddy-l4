@@ -20,8 +20,9 @@ const (
 	_tlsHeaderSize    = 5
 	_tlsSessionIDSize = 32
 
-	_serverRandomIdx = _tlsHeaderSize + 1 + 3 + 2
-	_sessionIDLenIdx = _tlsHeaderSize + 1 + 3 + 2 + _tlsRandomSize
+	_serverRandomIdx   = _tlsHeaderSize + 1 + 3 + 2
+	_sessionIDLenIdx   = _tlsHeaderSize + 1 + 3 + 2 + _tlsRandomSize
+	_tlsHmacHeaderSize = _tlsHeaderSize + _hmacSize
 
 	_hmacSize = 4
 )
@@ -62,6 +63,9 @@ func (m *MatchPassword) Match(hello *tls.ClientHelloInfo) bool {
 	helloBytes := cx.GetVar(ClientHelloBytesKey).([]byte)
 	matchPassword := m.verifyShadowTLSClientHello(helloBytes, m.Password)
 	m.logger.Info("client hello result", zap.Bool("match_password", matchPassword))
+	if matchPassword {
+		cx.SetVar(ClientHelloPasswordKey, m.Password)
+	}
 	return matchPassword
 }
 

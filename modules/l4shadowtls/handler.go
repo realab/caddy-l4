@@ -15,13 +15,23 @@
 package l4shadowtls
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
+	"slices"
+	"sync"
+	"sync/atomic"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mholt/caddy-l4/layer4"
 )
@@ -29,6 +39,10 @@ import (
 func init() {
 	caddy.RegisterModule(&ShadowTLSHandler{})
 }
+
+const (
+	_applicationData = 0x17
+)
 
 // Handler is a handler that can proxy connections.
 type ShadowTLSHandler struct {
@@ -76,18 +90,7 @@ func (h *ShadowTLSHandler) Handle(down *layer4.Connection, next layer4.Handler) 
 		return fmt.Errorf("no tls client hello found")
 	}
 
-	var handshakePeer *peer
-	for _, p := range h.HandshakeUpstream.peers {
-		hostName := repl.ReplaceAll(p.address.Host, "")
-		if hostName == clientHello.ServerName {
-			handshakePeer = p
-			break
-		}
-	}
-	if handshakePeer == nil {
-		return fmt.Errorf("no handshake peer found for server name: %s", clientHello.ServerName)
-	}
-	handshakeConn, err := h.dialHandshakePeer(handshakePeer, repl, down, clientHello)
+	handshakeConn, err := h.dialHandshakePeer(repl, down, clientHello)
 	if err != nil {
 		return err
 	}
@@ -97,21 +100,235 @@ func (h *ShadowTLSHandler) Handle(down *layer4.Connection, next layer4.Handler) 
 		_ = handshakeConn.Close()
 	}()
 
+	h.proxy(down, handshakeConn)
 	return nil
 }
 
-func (h *ShadowTLSHandler) dialHandshakePeer(p *peer, repl *caddy.Replacer, down *layer4.Connection, clientHello ClientHelloInfo) (net.Conn, error) {
-	addr := p.address
+func readTLSFrame(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+
+	length := int(uint16(hdr[3])<<8 | uint16(hdr[4])) // ignoring version in hdr[1:3] - like https://github.com/inetaf/tcpproxy/blob/master/sni.go#L170
+	body := make([]byte, length)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	frame := slices.Concat(hdr, body)
+	return frame, nil
+}
+
+func parseServerHelloBytes(helloBytes []byte) (*serverHelloMsg, error) {
+	const recordTypeHandshake = 0x16
+	if helloBytes[0] != recordTypeHandshake {
+		return nil, fmt.Errorf("expected handshake record type %d, got %d", recordTypeHandshake, helloBytes[0])
+	}
+
+	rawHello := helloBytes[_tlsHeaderSize:]
+	serverHello, err := parseRawServerHello(rawHello)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse server hello: %v", err)
+	}
+	return serverHello, nil
+}
+
+func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn) {
+	password, ok := down.GetVar(ClientHelloPasswordKey).(string)
+	if !ok {
+		h.logger.Error("cannot find client hello password in context")
+		return
+	}
+
+	helloBytes, ok := down.GetVar(ClientHelloBytesKey).([]byte)
+	if !ok {
+		h.logger.Error("no tls client hello bytes found")
+		return
+	}
+	if _, err := handshakeConn.Write(helloBytes); err != nil {
+		h.logger.Error("failed to write client hello to handshake connection",
+			zap.Error(err))
+		return
+	}
+
+	firstServerFrame, err := readTLSFrame(handshakeConn)
+	if err != nil {
+		h.logger.Error("failed to read first server frame",
+			zap.Error(err))
+		return
+	}
+	h.logger.Info("wrote first server hello to handshake connection")
+	if _, err := down.Write(firstServerFrame); err != nil {
+		h.logger.Error("failed to write first server hello to downstream",
+			zap.Error(err))
+		return
+	}
+
+	serverHello, err := parseServerHelloBytes(firstServerFrame)
+	if err != nil {
+		h.logger.Error("failed to read server hello", zap.Error(err))
+		h.bidirectionalProxy(down, handshakeConn)
+		return
+	}
+	serverRandom := serverHello.random
+	h.logger.Debug("got server random", zap.String("handshake_conn", handshakeConn.RemoteAddr().String()), zap.String("server_random", hex.EncodeToString(serverRandom)))
+
+	if serverHello.supportedVersion != tls.VersionTLS13 {
+		h.logger.Error("this handshake server does not support TLS 1.3", zap.String("handshake_conn", handshakeConn.RemoteAddr().String()))
+		h.bidirectionalProxy(down, handshakeConn)
+		return
+	}
+
+	hmacSRC := newShortHMAC(password, [2][]byte{serverRandom, []byte("C")})
+	hmacSRS := newShortHMAC(password, [2][]byte{serverRandom, []byte("S")})
+	hmacSR := newShortHMAC(password, [2][]byte{serverRandom, []byte{}})
+
+	authCtx, authCancel := context.WithCancel(down.Context)
+	defer authCancel()
+
+	authSignal := make(chan struct{})
+	defer close(authSignal)
+	key := kdf(password, serverRandom)
+
+	var pureData []byte
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		defer authCancel()
+		data, err := copyByFrameUntilHmacMatches(down, handshakeConn, hmacSRC)
+		if err != nil {
+			h.logger.Error("failed to copy by frame until hmac matches", zap.Error(err))
+			return err
+		}
+		pureData = data
+		return nil
+	})
+	eg.Go(func() error {
+		if err := copyByFrameWithModification(authCtx, handshakeConn, down, hmacSR, key); err != nil {
+			h.logger.Error("failed to copy by frame with modification", zap.Error(err))
+			return err
+		}
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		h.logger.Error("failed to relay handshake", zap.Error(err))
+		return
+	}
+
+	dataConn, err := h.dialDataPeer(down)
+	if err != nil {
+		return
+	}
+	if _, err := dataConn.Write(pureData); err != nil {
+		h.logger.Error("failed to write pure data to data peer", zap.Error(err))
+		return
+	}
+
+	verifiedRelay(dataConn, down, hmacSRS, hmacSRC)
+}
+
+func verifiedRelay(dataConn net.Conn, down *layer4.Connection, hAdd ShortHMAC, hVerify ShortHMAC) {
+
+}
+
+func copyRemoveAppdataAndVerify(downReader io.Reader, dataWriter io.Writer, hVerify ShortHMAC) {
+
+}
+func copyAddAppdata(ctx context.Context, dataReader io.Reader, downWriter io.Writer, hAdd ShortHMAC) {
+
+}
+
+func copyByFrameUntilHmacMatches(downReader io.Reader, handshakeWriter io.Writer, h ShortHMAC) ([]byte, error) {
+	const _tlsHmacHeaderSize = 9
+
+	for {
+		frame, err := readTLSFrame(downReader)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(frame) > 9 && frame[0] == _applicationData {
+			h0 := h.Clone()
+			h0.Write(frame[_tlsHmacHeaderSize:])
+			digest := h0.ShortDigest()
+
+			if bytes.Equal(frame[_tlsHeaderSize:_tlsHmacHeaderSize], digest[:]) {
+				h.Write(frame[_tlsHmacHeaderSize:])
+				h.Write(frame[_tlsHeaderSize:_tlsHmacHeaderSize])
+				return frame[_tlsHmacHeaderSize:], nil
+			}
+		}
+
+		if _, err := handshakeWriter.Write(frame); err != nil {
+			return nil, err
+		}
+	}
+}
+func copyByFrameWithModification(ctx context.Context, handshakeReader io.Reader, downWriter io.Writer, h ShortHMAC, key []byte) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			frame, err := readTLSFrame(handshakeReader)
+			if err != nil {
+				return err
+			}
+
+			if frame[0] == _applicationData {
+				xorSlice(frame[_tlsHeaderSize:], key)
+				h.Write(frame[_tlsHeaderSize:])
+				digest := h.ShortDigest()
+				frame = slices.Concat(frame, digest[:])
+
+				copy(frame[_tlsHmacHeaderSize:], frame[_tlsHeaderSize:len(frame)-_hmacSize])
+				copy(frame[_tlsHeaderSize:_tlsHeaderSize+_hmacSize], digest[:])
+
+				dataSize := binary.BigEndian.Uint16(frame[3:5])
+				dataSize += _hmacSize
+				binary.BigEndian.PutUint16(frame[3:5], dataSize)
+			}
+
+			if _, err := downWriter.Write(frame); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func kdf(password string, serverRandom []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(password))
+	h.Write(serverRandom)
+	return h.Sum(nil)
+}
+
+func xorSlice(data []byte, key []byte) {
+	for i, b := range data {
+		data[i] = b ^ key[i%len(key)]
+	}
+}
+
+func (h *ShadowTLSHandler) dialHandshakePeer(repl *caddy.Replacer, down *layer4.Connection, clientHello ClientHelloInfo) (net.Conn, error) {
+	var handshakePeer *peer
+	for _, p := range h.HandshakeUpstream.peers {
+		hostName := repl.ReplaceAll(p.address.Host, "")
+		if hostName == clientHello.ServerName {
+			handshakePeer = p
+			break
+		}
+	}
+	if handshakePeer == nil {
+		return nil, fmt.Errorf("no handshake peer found for server name: %s", clientHello.ServerName)
+	}
+
+	addr := handshakePeer.address
 	if addr.StartPort == 0 && addr.EndPort == 0 {
 		addr.StartPort = 443
 		addr.EndPort = 443
 	}
 
 	hostPort := repl.ReplaceAll(addr.JoinHostPort(0), "")
-
-	tlsCfg := new(tls.Config)
-	clientHello.FillTLSClientConfig(tlsCfg)
-	handshakeConn, err := tls.Dial(p.address.Network, hostPort, tlsCfg)
+	handshakeConn, err := net.Dial(handshakePeer.address.Network, hostPort)
 	if err != nil {
 		h.logger.Error("failed to dial handshake peer",
 			zap.String("remote", down.RemoteAddr().String()),
@@ -124,6 +341,99 @@ func (h *ShadowTLSHandler) dialHandshakePeer(p *peer, repl *caddy.Replacer, down
 		zap.String("handshake_server", hostPort),
 		zap.String("handshake_conn", handshakeConn.RemoteAddr().String()))
 	return handshakeConn, nil
+}
+
+func (h *ShadowTLSHandler) dialDataPeer(down *layer4.Connection) (net.Conn, error) {
+	var dataPeer *peer
+	for _, p := range h.DataUpstream.peers {
+		dataPeer = p
+		break
+	}
+	if dataPeer == nil {
+		return nil, fmt.Errorf("no data peer found")
+	}
+
+	addr := dataPeer.address
+	hostPort := addr.JoinHostPort(0)
+	dataConn, err := net.Dial(dataPeer.address.Network, hostPort)
+	if err != nil {
+		h.logger.Error("failed to dial data peer",
+			zap.String("remote", down.RemoteAddr().String()),
+			zap.String("data_server", hostPort),
+			zap.Error(err))
+		return nil, err
+	}
+	h.logger.Info("dial data peer",
+		zap.String("remote", down.RemoteAddr().String()),
+		zap.String("data_server", hostPort),
+		zap.String("data_conn", dataConn.RemoteAddr().String()))
+	return dataConn, nil
+}
+
+func (h *ShadowTLSHandler) bidirectionalProxy(down *layer4.Connection, up net.Conn) {
+	// every time we read from downstream, we write
+	// the same to each upstream; this is half of
+	// the proxy duplex
+	var downTee io.Reader = down
+	downTee = io.TeeReader(downTee, up)
+
+	var wg sync.WaitGroup
+	var downClosed atomic.Bool
+
+	wg.Add(1)
+
+	go func(up net.Conn) {
+		defer wg.Done()
+
+		if _, err := io.Copy(down, up); err != nil {
+			// If the downstream connection has been closed, we can assume this is
+			// the reason io.Copy() errored.  That's normal operation for UDP
+			// connections after idle timeout, so don't log an error in that case.
+			if !downClosed.Load() {
+				h.logger.Error("upstream connection",
+					zap.String("local_address", up.LocalAddr().String()),
+					zap.String("remote_address", up.RemoteAddr().String()),
+					zap.Error(err),
+				)
+			}
+		}
+	}(up)
+
+	downConnClosedCh := make(chan struct{}, 1)
+
+	go func() {
+		// read from downstream until connection is closed;
+		// TODO: this pumps the reader, but writing into discard is a weird way to do it; could be avoided if we used io.Pipe - see _gitignore/oldtee.go.txt
+		_, _ = io.Copy(io.Discard, downTee)
+		downConnClosedCh <- struct{}{}
+
+		// Shut down the writing side of all upstream connections, in case
+		// that the downstream connection is half closed. (issue #40)
+		//
+		// UDP connections meanwhile don't implement CloseWrite(), but in order
+		// to ensure io.Copy() in the per-upstream goroutines (above) returns,
+		// we need to close the socket.  This will cause io.Copy() return an
+		// error, which in this particular case is expected, so we signal the
+		// intentional closure by setting this flag.
+		downClosed.Store(true)
+		if conn, ok := up.(closeWriter); ok {
+			_ = conn.CloseWrite()
+		} else {
+			_ = up.Close()
+		}
+	}()
+
+	// wait for reading from all upstream connections
+	wg.Wait()
+
+	// Shut down the writing side of the downstream connection, in case that
+	// the upstream connections are all half closed.
+	if downConn, ok := down.Conn.(closeWriter); ok {
+		_ = downConn.CloseWrite()
+	}
+
+	// Wait for reading from the downstream connection, if possible.
+	<-downConnClosedCh
 }
 
 func (h *ShadowTLSHandler) Cleanup() error {
