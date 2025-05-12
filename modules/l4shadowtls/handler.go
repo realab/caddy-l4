@@ -94,11 +94,7 @@ func (h *ShadowTLSHandler) Handle(down *layer4.Connection, next layer4.Handler) 
 	if err != nil {
 		return err
 	}
-
-	// make sure upstream connections all get closed
-	defer func() {
-		_ = handshakeConn.Close()
-	}()
+	defer handshakeConn.Close()
 
 	h.proxy(down, handshakeConn)
 	return nil
@@ -182,13 +178,10 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	hmacSRC := newShortHMAC(password, [2][]byte{serverRandom, []byte("C")})
 	hmacSRS := newShortHMAC(password, [2][]byte{serverRandom, []byte("S")})
 	hmacSR := newShortHMAC(password, [2][]byte{serverRandom, []byte{}})
+	key := kdf(password, serverRandom)
 
 	authCtx, authCancel := context.WithCancel(down.Context)
 	defer authCancel()
-
-	authSignal := make(chan struct{})
-	defer close(authSignal)
-	key := kdf(password, serverRandom)
 
 	var pureData []byte
 	eg := errgroup.Group{}
@@ -218,6 +211,7 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	if err != nil {
 		return
 	}
+	defer dataConn.Close()
 	if _, err := dataConn.Write(pureData); err != nil {
 		h.logger.Error("failed to write pure data to data peer", zap.Error(err))
 		return
