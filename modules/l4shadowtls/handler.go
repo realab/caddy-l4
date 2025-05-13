@@ -238,15 +238,28 @@ func (h *verifiedRelay) verifiedRelay(dataConn net.Conn, down *layer4.Connection
 	eg := errgroup.Group{}
 	eg.Go(func() error {
 		defer h.cancel()
-		return copyRemoveAppdataAndVerify(h.ctx, down, dataConn, hmacVerify)
+		if err := copyRemoveAppdataAndVerify(h.ctx, down, dataConn, hmacVerify); err != nil {
+			h.logger.Info("failed to copy remove appdata and verify", zap.Error(err))
+			return nil
+		}
+		return nil
 	})
 	eg.Go(func() error {
 		defer h.cancel()
-		return copyAddAppdata(h.ctx, dataConn, down, hmacAdd)
+		if err := copyAddAppdata(h.ctx, dataConn, down, hmacAdd); err != nil {
+			h.logger.Info("failed to copy add appdata", zap.Error(err))
+			return nil
+		}
+		return nil
 	})
 	eg.Go(func() error {
 		<-h.ctx.Done()
-		_ = dataConn.Close()
+		cw, ok := dataConn.(closeWriter)
+		if ok {
+			_ = cw.CloseWrite()
+		} else {
+			dataConn.Close()
+		}
 		_ = down.Close()
 		return nil
 	})
