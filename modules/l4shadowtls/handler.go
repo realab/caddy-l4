@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,10 +31,9 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/mholt/caddy-l4/layer4"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-
-	"github.com/mholt/caddy-l4/layer4"
 )
 
 func init() {
@@ -41,7 +41,11 @@ func init() {
 }
 
 const (
+	_alert           = 0x15
 	_applicationData = 0x17
+
+	_tlsMajor              = 0x3
+	_tlsMinor0, _tlsMinor1 = 0x03, 0x01
 )
 
 // Handler is a handler that can proxy connections.
@@ -176,18 +180,15 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	}
 
 	hmacSRC := newShortHMAC(password, [2][]byte{serverRandom, []byte("C")})
-	hmacSRS := newShortHMAC(password, [2][]byte{serverRandom, []byte("S")})
-	hmacSR := newShortHMAC(password, [2][]byte{serverRandom, []byte{}})
+	hmacSR := newShortHMAC(password, [2][]byte{serverRandom, {}})
 	key := kdf(password, serverRandom)
 
-	authCtx, authCancel := context.WithCancel(down.Context)
-	defer authCancel()
-
 	var pureData []byte
-	eg := errgroup.Group{}
+	eg, ctx := errgroup.WithContext(down.Context)
+	verifyCtx, verifyCancel := context.WithCancel(ctx)
 	eg.Go(func() error {
-		defer authCancel()
-		data, err := copyByFrameUntilHmacMatches(down, handshakeConn, hmacSRC)
+		defer verifyCancel()
+		data, err := copyByFrameUntilHmacMatches(verifyCtx, down, handshakeConn, hmacSRC)
 		if err != nil {
 			h.logger.Error("failed to copy by frame until hmac matches", zap.Error(err))
 			return err
@@ -196,7 +197,7 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 		return nil
 	})
 	eg.Go(func() error {
-		if err := copyByFrameWithModification(authCtx, handshakeConn, down, hmacSR, key); err != nil {
+		if err := copyByFrameWithModification(verifyCtx, handshakeConn, down, hmacSR, key); err != nil {
 			h.logger.Error("failed to copy by frame with modification", zap.Error(err))
 			return err
 		}
@@ -217,43 +218,195 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 		return
 	}
 
-	verifiedRelay(dataConn, down, hmacSRS, hmacSRC)
+	hmacSRS := newShortHMAC(password, [2][]byte{serverRandom, []byte("S")})
+
+	vr := &verifiedRelay{
+		ShadowTLSHandler: h,
+	}
+	vr.ctx, vr.cancel = context.WithCancel(down.Context)
+	vr.verifiedRelay(dataConn, down, hmacSRS, hmacSRC)
 }
 
-func verifiedRelay(dataConn net.Conn, down *layer4.Connection, hAdd ShortHMAC, hVerify ShortHMAC) {
+type verifiedRelay struct {
+	*ShadowTLSHandler
 
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func copyRemoveAppdataAndVerify(downReader io.Reader, dataWriter io.Writer, hVerify ShortHMAC) {
-
+func (h *verifiedRelay) verifiedRelay(dataConn net.Conn, down *layer4.Connection, hmacAdd ShortHMAC, hmacVerify ShortHMAC) {
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		defer h.cancel()
+		return copyRemoveAppdataAndVerify(h.ctx, down, dataConn, hmacVerify)
+	})
+	eg.Go(func() error {
+		defer h.cancel()
+		return copyAddAppdata(h.ctx, dataConn, down, hmacAdd)
+	})
+	eg.Go(func() error {
+		<-h.ctx.Done()
+		_ = dataConn.Close()
+		_ = down.Close()
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		h.logger.Error("failed to relay verified connection data", zap.Error(err))
+	}
 }
-func copyAddAppdata(ctx context.Context, dataReader io.Reader, downWriter io.Writer, hAdd ShortHMAC) {
 
+type TLSFrameReader interface {
+	NextTLSFrame() ([]byte, error)
 }
 
-func copyByFrameUntilHmacMatches(downReader io.Reader, handshakeWriter io.Writer, h ShortHMAC) ([]byte, error) {
+const _bufferSize = 2048
+
+type tlsFrameReader struct {
+	r      io.Reader
+	buffer [_bufferSize]byte
+}
+
+func (r *tlsFrameReader) NextTLSFrame() ([]byte, error) {
+	hdr := r.buffer[:_tlsHeaderSize]
+	if _, err := io.ReadFull(r.r, hdr); err != nil {
+		return nil, err
+	}
+
+	length := int(uint16(hdr[3])<<8 | uint16(hdr[4]))
+	body := r.buffer[_tlsHeaderSize : _tlsHeaderSize+length]
+	n, err := io.ReadFull(r.r, body)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			if n == length {
+				return r.buffer[:_tlsHeaderSize+length], nil
+			}
+			return nil, io.EOF
+		}
+		return nil, err
+	}
+	return r.buffer[:_tlsHeaderSize+length], nil
+}
+
+// relay downstream to data server, remove application data and verify hmac
+func copyRemoveAppdataAndVerify(ctx context.Context, downReader io.Reader, dataWriter io.Writer, hVerify ShortHMAC) error {
+	tlsReader := &tlsFrameReader{r: downReader}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			frame, err := tlsReader.NextTLSFrame()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+
+			switch frame[0] {
+			case _alert:
+				return fmt.Errorf("exit because alert frame received")
+			case _applicationData:
+				if !verifyAppdata(frame, hVerify, true) {
+					return fmt.Errorf("exit because hmac verification failed")
+				}
+				if _, err := dataWriter.Write(frame[_tlsHmacHeaderSize:]); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("exit because unknown frame type received: %d", frame[0])
+			}
+		}
+	}
+}
+
+func verifyAppdata(frame []byte, hVerify ShortHMAC, sep bool) bool {
+	if frame[1] != _tlsMajor ||
+		frame[2] != _tlsMinor0 ||
+		len(frame) < _tlsHmacHeaderSize {
+		return false
+	}
+
+	hVerify.Write(frame[_tlsHmacHeaderSize:])
+	expectedDigest := hVerify.ShortDigest()
+	if sep {
+		hVerify.Write(expectedDigest[:])
+	}
+
+	return bytes.Equal(frame[_tlsHeaderSize:_tlsHmacHeaderSize], expectedDigest[:])
+}
+
+// relay data server to downstream, pack as tls application data frame
+func copyAddAppdata(ctx context.Context, dataReader io.Reader, downWriter io.Writer, hmacAdd ShortHMAC) error {
+	const _bufferSize = 4096
+	var _defaultHeader = [_tlsHmacHeaderSize]byte{_applicationData, _tlsMajor, _tlsMinor0, 0, 0, 0, 0, 0, 0}
+
+	buffer := make([]byte, _bufferSize)
+	copy(buffer[:_tlsHmacHeaderSize], _defaultHeader[:])
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			frameLen, err := dataReader.Read(buffer[_tlsHmacHeaderSize:])
+			processData := func() error {
+				binary.BigEndian.PutUint16(buffer[3:5], uint16(frameLen+_hmacSize))
+
+				hmacAdd.Write(buffer[_tlsHmacHeaderSize : _tlsHmacHeaderSize+frameLen])
+				digest := hmacAdd.ShortDigest()
+				hmacAdd.Write(digest[:])
+				copy(buffer[_tlsHeaderSize:_tlsHeaderSize+_hmacSize], digest[:])
+
+				if _, err := downWriter.Write(buffer[:_tlsHmacHeaderSize+frameLen]); err != nil {
+					return err
+				}
+				return nil
+			}
+			if frameLen > 0 {
+				if err := processData(); err != nil {
+					return err
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+func copyByFrameUntilHmacMatches(ctx context.Context, downReader io.Reader, handshakeWriter io.Writer, h ShortHMAC) ([]byte, error) {
 	const _tlsHmacHeaderSize = 9
 
 	for {
-		frame, err := readTLSFrame(downReader)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(frame) > 9 && frame[0] == _applicationData {
-			h0 := h.Clone()
-			h0.Write(frame[_tlsHmacHeaderSize:])
-			digest := h0.ShortDigest()
-
-			if bytes.Equal(frame[_tlsHeaderSize:_tlsHmacHeaderSize], digest[:]) {
-				h.Write(frame[_tlsHmacHeaderSize:])
-				h.Write(frame[_tlsHeaderSize:_tlsHmacHeaderSize])
-				return frame[_tlsHmacHeaderSize:], nil
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		default:
+			frame, err := readTLSFrame(downReader)
+			if err != nil {
+				return nil, err
 			}
-		}
 
-		if _, err := handshakeWriter.Write(frame); err != nil {
-			return nil, err
+			if len(frame) > 9 && frame[0] == _applicationData {
+				h0 := h.Clone()
+				h0.Write(frame[_tlsHmacHeaderSize:])
+				digest := h0.ShortDigest()
+
+				if bytes.Equal(frame[_tlsHeaderSize:_tlsHmacHeaderSize], digest[:]) {
+					h.Write(frame[_tlsHmacHeaderSize:])
+					h.Write(frame[_tlsHeaderSize:_tlsHmacHeaderSize])
+					return frame[_tlsHmacHeaderSize:], nil
+				}
+			}
+
+			if _, err := handshakeWriter.Write(frame); err != nil {
+				return nil, err
+			}
 		}
 	}
 }
