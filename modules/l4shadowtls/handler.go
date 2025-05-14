@@ -198,7 +198,7 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	})
 	eg.Go(func() error {
 		if err := copyByFrameWithModification(verifyCtx, handshakeConn, down, hmacSR, key); err != nil {
-			h.logger.Warn("failed to copy by frame with modification", zap.Error(err))
+			h.logger.Debug("failed to copy by frame with modification", zap.Error(err))
 			return nil
 		}
 		return nil
@@ -244,7 +244,7 @@ func (h *verifiedRelay) verifiedRelay(dataConn net.Conn, down *layer4.Connection
 	eg.Go(func() error {
 		defer h.cancel()
 		if err := copyRemoveAppdataAndVerify(h.ctx, down, dataConn, hmacVerify); err != nil {
-			h.logger.Info("failed to copy remove appdata and verify", zap.Error(err))
+			h.logger.Debug("failed to copy remove appdata and verify", zap.Error(err))
 			return nil
 		}
 		return nil
@@ -252,7 +252,7 @@ func (h *verifiedRelay) verifiedRelay(dataConn net.Conn, down *layer4.Connection
 	eg.Go(func() error {
 		defer h.cancel()
 		if err := copyAddAppdata(h.ctx, dataConn, down, hmacAdd); err != nil {
-			h.logger.Info("failed to copy add appdata", zap.Error(err))
+			h.logger.Debug("failed to copy add appdata", zap.Error(err))
 			return nil
 		}
 		return nil
