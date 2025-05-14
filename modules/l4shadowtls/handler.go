@@ -440,7 +440,7 @@ func copyByFrameWithModification(ctx context.Context, handshakeReader io.Reader,
 				digest := h.ShortDigest()
 				frame = slices.Concat(frame, digest[:])
 
-				copy(frame[_tlsHmacHeaderSize:], frame[_tlsHeaderSize:len(frame)-_hmacSize])
+				copy(frame[_tlsHmacHeaderSize:], frame[_tlsHeaderSize:len(frame)-_tlsHmacHeaderSize])
 				copy(frame[_tlsHeaderSize:_tlsHeaderSize+_hmacSize], digest[:])
 
 				dataSize := binary.BigEndian.Uint16(frame[3:5])
