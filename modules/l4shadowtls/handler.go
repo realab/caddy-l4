@@ -277,11 +277,11 @@ type TLSFrameReader interface {
 	NextTLSFrame() ([]byte, error)
 }
 
-const _bufferSize = 2048
+const _initBufferSize = 2048
 
 type tlsFrameReader struct {
 	r      io.Reader
-	buffer [_bufferSize]byte
+	buffer []byte
 }
 
 func (r *tlsFrameReader) NextTLSFrame() ([]byte, error) {
@@ -291,6 +291,9 @@ func (r *tlsFrameReader) NextTLSFrame() ([]byte, error) {
 	}
 
 	length := int(uint16(hdr[3])<<8 | uint16(hdr[4]))
+	if length > len(r.buffer)-_tlsHeaderSize {
+		r.buffer = slices.Grow(r.buffer, length-(len(r.buffer)-_tlsHeaderSize))
+	}
 	body := r.buffer[_tlsHeaderSize : _tlsHeaderSize+length]
 	n, err := io.ReadFull(r.r, body)
 	if err != nil {
@@ -307,7 +310,10 @@ func (r *tlsFrameReader) NextTLSFrame() ([]byte, error) {
 
 // relay downstream to data server, remove application data and verify hmac
 func copyRemoveAppdataAndVerify(ctx context.Context, downReader io.Reader, dataWriter io.Writer, hVerify ShortHMAC) error {
-	tlsReader := &tlsFrameReader{r: downReader}
+	tlsReader := &tlsFrameReader{
+		r:      downReader,
+		buffer: make([]byte, _initBufferSize),
+	}
 
 	for {
 		select {
