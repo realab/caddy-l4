@@ -502,7 +502,7 @@ func (h *ShadowTLSHandler) dialHandshakePeer(repl *caddy.Replacer, down *layer4.
 			zap.Error(err))
 		return nil, err
 	}
-	h.logger.Info("dial handshake peer",
+	h.logger.Debug("dial handshake peer",
 		zap.String("remote", down.RemoteAddr().String()),
 		zap.String("handshake_server", hostPort),
 		zap.String("handshake_conn", handshakeConn.RemoteAddr().String()))
@@ -529,7 +529,7 @@ func (h *ShadowTLSHandler) dialDataPeer(down *layer4.Connection) (net.Conn, erro
 			zap.Error(err))
 		return nil, err
 	}
-	h.logger.Info("dial data peer",
+	h.logger.Debug("dial data peer",
 		zap.String("remote", down.RemoteAddr().String()),
 		zap.String("data_server", hostPort),
 		zap.String("data_conn", dataConn.RemoteAddr().String()))
