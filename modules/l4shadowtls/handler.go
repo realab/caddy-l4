@@ -199,7 +199,7 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	eg.Go(func() error {
 		if err := copyByFrameWithModification(verifyCtx, handshakeConn, down, hmacSR, key); err != nil {
 			h.logger.Warn("failed to copy by frame with modification", zap.Error(err))
-			return err
+			return nil
 		}
 		return nil
 	})
