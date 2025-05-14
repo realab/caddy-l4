@@ -184,11 +184,11 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	key := kdf(password, serverRandom)
 
 	var pureData []byte
-	eg, ctx := errgroup.WithContext(down.Context)
-	verifyCtx, verifyCancel := context.WithCancel(ctx)
+	eg := errgroup.Group{}
+	verifyCtx, verifyCancel := context.WithCancel(down.Context)
 	eg.Go(func() error {
 		defer verifyCancel()
-		data, err := copyByFrameUntilHmacMatches(verifyCtx, down, handshakeConn, hmacSRC)
+		data, err := copyByFrameUntilHmacMatches(down, handshakeConn, hmacSRC)
 		if err != nil {
 			h.logger.Error("failed to copy by frame until hmac matches", zap.Error(err))
 			return err
@@ -198,9 +198,14 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 	})
 	eg.Go(func() error {
 		if err := copyByFrameWithModification(verifyCtx, handshakeConn, down, hmacSR, key); err != nil {
-			h.logger.Error("failed to copy by frame with modification", zap.Error(err))
+			h.logger.Warn("failed to copy by frame with modification", zap.Error(err))
 			return err
 		}
+		return nil
+	})
+	eg.Go(func() error {
+		<-verifyCtx.Done()
+		_ = handshakeConn.Close()
 		return nil
 	})
 	if err := eg.Wait(); err != nil {
@@ -392,65 +397,60 @@ func copyAddAppdata(ctx context.Context, dataReader io.Reader, downWriter io.Wri
 	}
 }
 
-func copyByFrameUntilHmacMatches(ctx context.Context, downReader io.Reader, handshakeWriter io.Writer, h ShortHMAC) ([]byte, error) {
+func copyByFrameUntilHmacMatches(downReader io.Reader, handshakeWriter io.Writer, h ShortHMAC) ([]byte, error) {
 	const _tlsHmacHeaderSize = 9
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil, nil
-		default:
-			frame, err := readTLSFrame(downReader)
-			if err != nil {
-				return nil, err
-			}
+		frame, err := readTLSFrame(downReader)
+		if err != nil {
+			return nil, err
+		}
 
-			if len(frame) > 9 && frame[0] == _applicationData {
-				h0 := h.Clone()
-				h0.Write(frame[_tlsHmacHeaderSize:])
-				digest := h0.ShortDigest()
+		if len(frame) > 9 && frame[0] == _applicationData {
+			h0 := h.Clone()
+			h0.Write(frame[_tlsHmacHeaderSize:])
+			digest := h0.ShortDigest()
 
-				if bytes.Equal(frame[_tlsHeaderSize:_tlsHmacHeaderSize], digest[:]) {
-					h.Write(frame[_tlsHmacHeaderSize:])
-					h.Write(frame[_tlsHeaderSize:_tlsHmacHeaderSize])
-					return frame[_tlsHmacHeaderSize:], nil
-				}
+			if bytes.Equal(frame[_tlsHeaderSize:_tlsHmacHeaderSize], digest[:]) {
+				h.Write(frame[_tlsHmacHeaderSize:])
+				h.Write(frame[_tlsHeaderSize:_tlsHmacHeaderSize])
+				return frame[_tlsHmacHeaderSize:], nil
 			}
+		}
 
-			if _, err := handshakeWriter.Write(frame); err != nil {
-				return nil, err
-			}
+		if _, err := handshakeWriter.Write(frame); err != nil {
+			return nil, err
 		}
 	}
 }
 func copyByFrameWithModification(ctx context.Context, handshakeReader io.Reader, downWriter io.Writer, h ShortHMAC, key []byte) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			frame, err := readTLSFrame(handshakeReader)
-			if err != nil {
+		frame, err := readTLSFrame(handshakeReader)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
 				return err
 			}
+		}
 
-			if frame[0] == _applicationData {
-				xorSlice(frame[_tlsHeaderSize:], key)
-				h.Write(frame[_tlsHeaderSize:])
-				digest := h.ShortDigest()
-				frame = slices.Concat(frame, digest[:])
+		if frame[0] == _applicationData {
+			xorSlice(frame[_tlsHeaderSize:], key)
+			h.Write(frame[_tlsHeaderSize:])
+			digest := h.ShortDigest()
+			frame = slices.Concat(frame, digest[:])
 
-				copy(frame[_tlsHmacHeaderSize:], frame[_tlsHeaderSize:len(frame)-_tlsHmacHeaderSize])
-				copy(frame[_tlsHeaderSize:_tlsHeaderSize+_hmacSize], digest[:])
+			copy(frame[_tlsHmacHeaderSize:], frame[_tlsHeaderSize:len(frame)-_hmacSize])
+			copy(frame[_tlsHeaderSize:_tlsHeaderSize+_hmacSize], digest[:])
 
-				dataSize := binary.BigEndian.Uint16(frame[3:5])
-				dataSize += _hmacSize
-				binary.BigEndian.PutUint16(frame[3:5], dataSize)
-			}
+			dataSize := binary.BigEndian.Uint16(frame[3:5])
+			dataSize += _hmacSize
+			binary.BigEndian.PutUint16(frame[3:5], dataSize)
+		}
 
-			if _, err := downWriter.Write(frame); err != nil {
-				return err
-			}
+		if _, err := downWriter.Write(frame); err != nil {
+			return err
 		}
 	}
 }
