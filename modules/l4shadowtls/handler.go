@@ -157,7 +157,7 @@ func (h *ShadowTLSHandler) proxy(down *layer4.Connection, handshakeConn net.Conn
 			zap.Error(err))
 		return
 	}
-	h.logger.Info("wrote first server hello to handshake connection")
+	h.logger.Debug("wrote first server hello to downstream connection")
 	if _, err := down.Write(firstServerFrame); err != nil {
 		h.logger.Error("failed to write first server hello to downstream",
 			zap.Error(err))
